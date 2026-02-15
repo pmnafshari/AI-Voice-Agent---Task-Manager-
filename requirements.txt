@@ -1,0 +1,8 @@
+streamlit
+SpeechRecognition
+google-generativeai
+edge-tts
+python-dotenv
+audiorecorder
+notion-client
+watchdog
