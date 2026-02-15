@@ -41,7 +41,7 @@ if not os.getenv("GEMINI_API_KEY"):
     st.stop()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-2.5-flash')
+model = genai.GenerativeModel('gemini-flash-latest')
 
 try:
     notion = Client(auth=os.getenv("NOTION_API_KEY"))
@@ -107,6 +107,54 @@ def add_task_to_notion(task_name, deadline=None):
     except Exception as e:
         return False, f"I couldn't save that to Notion. Error: {e}"
 
+def find_task(query):
+    """Search for a page in the Notion DB."""
+    try:
+        response = notion.search(query=query, filter={"property": "object", "value": "page"})
+        results = response.get("results", [])
+        # Ideally check if parent.database_id matches NOTION_DB_ID
+        for page in results:
+            if page["parent"].get("database_id", "").replace("-", "") == NOTION_DB_ID.replace("-", ""):
+                return page
+        return results[0] if results else None
+    except:
+        return None
+
+def update_task(task_name, new_status=None, new_deadline=None):
+    page = find_task(task_name)
+    if not page:
+        return False, f"I couldn't find any task matching '{task_name}'."
+    
+    props = {}
+    if new_status:
+        # Standardize status (assuming 'To DO', 'In progress', 'Done' exist in Notion)
+        s = new_status.lower()
+        if "done" in s or "complete" in s: final_s = "Done"
+        elif "progress" in s or "doing" in s: final_s = "In progress"
+        else: final_s = "To DO"
+        props["Status"] = {"select": {"name": final_s}}
+        
+    if new_deadline:
+        props["Deadline"] = {"email": new_deadline}
+        
+    try:
+        notion.pages.update(page_id=page["id"], properties=props)
+        title = page["properties"]["Name"]["title"][0]["text"]["content"]
+        return True, f"Updated '{title}'."
+    except Exception as e:
+        return False, f"Update Error: {e}"
+
+def delete_task(task_name):
+    page = find_task(task_name)
+    if not page:
+        return False, f"I couldn't find task '{task_name}'."
+    try:
+        notion.pages.update(page_id=page["id"], archived=True)
+        title = page["properties"]["Name"]["title"][0]["text"]["content"]
+        return True, f"Deleted '{title}'."
+    except Exception as e:
+        return False, f"Delete Error: {e}"
+
 def process_command(text, lang_name):
     """The Brain: Decides what the user wants."""
     
@@ -115,16 +163,24 @@ def process_command(text, lang_name):
     You are a friendly and helpful assistant fluent in Persian, English, and Italian.
     The user is speaking in **{lang_name}**.
     
-    Your goal is to sound natural, warm, and human-like. Avoid robotic phrases like "Task created" or "Understood".
-    Instead, use phrases like "Got it!", "Sure thing," "I'll handle that," or "No problem."
+    Your goal is to sound natural, warm, and human-like.
     
     Analyze the input and return ONLY a JSON object.
     
-    Scenario 1: Add task.
-    Output JSON: {{"action": "create_task", "task": "Task name in {lang_name}", "deadline": "YYYY-MM-DD (if mentioned, else null)", "reply": "Casual, friendly confirmation in {lang_name}"}}
+    Actions:
+    1. "create_task": Add a new task.
+    2. "update_task": Change status (e.g. done, doing) or deadline.
+    3. "delete_task": Remove/Archive a task.
+    4. "chat": General conversation.
     
-    Scenario 2: Chat/Technical Question.
-    Output JSON: {{"action": "chat", "reply": "Friendly, helpful answer in {lang_name}"}}
+    Output JSON Schema:
+    {{
+        "action": "create_task" | "update_task" | "delete_task" | "chat",
+        "task": "Task Name (for create/update/delete)",
+        "status": "New Status (e.g. 'Done', 'In progress', 'To DO') - optional for update",
+        "deadline": "YYYY-MM-DD - optional for create/update",
+        "reply": "Friendly response in {lang_name}"
+    }}
     
     User Input: {text}
     """
@@ -192,8 +248,20 @@ if len(audio) > 0:
                 else:
                     final_reply = ai_data.get("reply", "Done.")
                     
-                    if ai_data.get("action") == "create_task":
-                        success, msg = add_task_to_notion(ai_data["task"], ai_data.get("deadline"))
+                    action = ai_data.get("action")
+                    task_name = ai_data.get("task")
+                    
+                    if action == "create_task":
+                        success, msg = add_task_to_notion(task_name, ai_data.get("deadline"))
+                    elif action == "update_task":
+                        success, msg = update_task(task_name, ai_data.get("status"), ai_data.get("deadline"))
+                    elif action == "delete_task":
+                        success, msg = delete_task(task_name)
+                    else:
+                        success = True
+                        msg = ""
+                        
+                    if action in ["create_task", "update_task", "delete_task"]:
                         if success:
                             final_reply = f"✅ {final_reply}"
                         else:
