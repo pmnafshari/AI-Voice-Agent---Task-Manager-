@@ -6,3 +6,4 @@ python-dotenv
 audiorecorder
 notion-client
 watchdog
+pydub

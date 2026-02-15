@@ -224,3 +224,10 @@ yarn-error.log*
 
 # Node modules (if any frontend work happens later)
 node_modules/
+
+# Chat History
+chat_history.json
+
+# Helper Scripts
+list_models.py
+
