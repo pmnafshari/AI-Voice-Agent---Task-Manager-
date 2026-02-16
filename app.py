@@ -10,6 +10,13 @@ from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from audiorecorder import audiorecorder
 from notion_client import Client
+import uuid
+import logging
+import requests
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- 1. Language & Voice Settings ---
 LANG_CONFIG = {
@@ -100,13 +107,30 @@ if not os.getenv("GEMINI_API_KEY"):
     st.stop()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-flash-latest')
+model = genai.GenerativeModel('gemini-2.0-flash-lite')
 
 try:
+    if not os.getenv("NOTION_API_KEY"):
+        st.error("NOTION_API_KEY is not set in .env file")
+        st.stop()
+        
     notion = Client(auth=os.getenv("NOTION_API_KEY"))
-    NOTION_DB_ID = os.getenv("NOTION_DB_ID")
-except:
-    st.error("🚫 I couldn't find your Notion settings. Please check your .env file!")
+    
+    # helper to format UUID
+    def format_uuid(id_str):
+        try:
+            return str(uuid.UUID(id_str))
+        except ValueError:
+            return id_str
+
+    raw_db_id = os.getenv("NOTION_DB_ID", "")
+    NOTION_DB_ID = format_uuid(raw_db_id)
+    
+    if not NOTION_DB_ID:
+         st.warning("NOTION_DB_ID is not set in .env")
+
+except Exception as e:
+    st.error(f"Error initializing Notion client: {e}")
     st.stop()
 
 # --- 4. Custom Styling ---
@@ -119,6 +143,10 @@ st.markdown("""
     }
     .ai-chat {
         background-color: #1c1f26; padding: 15px; border-radius: 15px 15px 15px 0;
+        margin: 10px 0; text-align: left; border: 1px solid #4CAF50;
+    }
+    .ai-chat-error {
+        background-color: #261c1c; padding: 15px; border-radius: 15px 15px 15px 0;
         margin: 10px 0; text-align: left; border: 1px solid #FF4B4B;
     }
     /* Language dropdown style */
@@ -150,10 +178,6 @@ async def text_to_speech(text, voice_name):
     """Convert text to speech using the selected voice."""
     communicate = edge_tts.Communicate(text, voice_name)
     await communicate.save("reply.mp3")
-
-def play_audio():
-    if os.path.exists("reply.mp3"):
-        st.audio("reply.mp3", format="audio/mp3", autoplay=True)
 
 def audio_to_text(audio_segment, lang_code):
     """Convert audio to text using the specified language code."""
@@ -203,7 +227,6 @@ def get_tasks(time_filter="all", lang="English"):
         # We will fetch all active tasks and filter in Python since 'Deadline' is a string(email).
         
         query_payload = {
-            "database_id": NOTION_DB_ID,
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"does_not_equal": "Done"}}
@@ -211,7 +234,26 @@ def get_tasks(time_filter="all", lang="English"):
             }
         }
         
-        response = notion.databases.query(**query_payload)
+        # response = notion.request(
+        #     path=f"databases/{NOTION_DB_ID}/query",
+        #     method="POST",
+        #     body=query_payload
+        # )
+        
+        headers = {
+            "Authorization": f"Bearer {os.getenv('NOTION_API_KEY')}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        res = requests.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+            json=query_payload,
+            headers=headers
+        )
+        if res.status_code != 200:
+             raise Exception(f"Notion API Error: {res.text}")
+             
+        response = res.json()
         results = response.get("results", [])
         
         filtered_tasks = []
@@ -306,15 +348,20 @@ def process_command(text, lang_name):
     
     Actions:
     1. "create_task": Add a new task.
-    2. "update_task": Change status or deadline.
-    3. "delete_task": Remove/Archive a task.
+    2. "update_task": Change status or deadline. ONLY if user explicitly names a task to update.
+    3. "delete_task": Remove/Archive a task. ONLY if user explicitly names a task.
     4. "read_tasks": Query existing tasks (e.g., "What do I have today?", "Show my tasks").
-    5. "chat": General conversation.
+    5. "chat": General conversation, OR if the input is unclear/ambiguous.
+    
+    IMPORTANT: 
+    - Do NOT guess a task name if the user didn't say one. 
+    - If the input is just one word like "valid", "test", or "hello", treat it as "chat" and ask for clarification.
+    - Do NOT return "update_task" unless a specific task name is mentioned.
     
     Output JSON Schema:
     {{
         "action": "create_task" | "update_task" | "delete_task" | "read_tasks" | "chat",
-        "task": "Task Name",
+        "task": "Task Name (Required for create/update/delete)",
         "status": "New Status",
         "deadline": "YYYY-MM-DD",
         "time_filter": "today" | "tomorrow" | "week" | "overdue" | "all" (for read_tasks),
@@ -349,25 +396,141 @@ def process_command(text, lang_name):
 
 st.title("Task manager AI Voice Agent")
 
-# Language Selection
+# Sidebar for History & New Chat
+with st.sidebar:
+    st.header("💬 Chat History")
+    if st.button("➕ New Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.current_chat_id = str(uuid.uuid4())
+        save_chat_history([]) # Save empty to init file
+        st.rerun()
+    
+    st.markdown("---")
+    
+    
+    # List history files
+    history_dir = "history"
+    if not os.path.exists(history_dir):
+        os.makedirs(history_dir)
+    
+    # Rename current chat
+    if "current_chat_id" in st.session_state:
+        current_name = st.session_state.current_chat_id
+        new_name = st.text_input("🖊️ Rename Chat", value=current_name)
+        if new_name != current_name:
+            if new_name and not os.path.exists(os.path.join(history_dir, f"{new_name}.json")):
+                try:
+                    os.rename(
+                        os.path.join(history_dir, f"{current_name}.json"),
+                        os.path.join(history_dir, f"{new_name}.json")
+                    )
+                    st.session_state.current_chat_id = new_name
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error renaming: {e}")
+            elif os.path.exists(os.path.join(history_dir, f"{new_name}.json")):
+                st.warning("A chat with this name already exists.")
+
+    st.markdown("---")
+    
+    files = [f for f in os.listdir(history_dir) if f.endswith(".json")]
+    # Sort by modification time (newest first)
+    files.sort(key=lambda x: os.path.getmtime(os.path.join(history_dir, x)), reverse=True)
+    
+    for filename in files:
+        name = filename.replace('.json', '')
+        file_path = os.path.join(history_dir, filename)
+        
+        # Highlight current chat
+        label = f"🟢 {name}" if name == st.session_state.get("current_chat_id") else f"📄 {name}"
+        
+        if st.button(label, key=filename, use_container_width=True):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    st.session_state.messages = json.load(f)
+                    st.session_state.current_chat_id = name
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error loading {filename}: {e}")
+
+# Language Selection (Default to English - Index 1)
+# Keys: ["Persian 🇮🇷", "English 🇺🇸", "Italian 🇮🇹"]
 selected_lang_label = st.selectbox(
     "Choose your language:",
-    options=list(LANG_CONFIG.keys())
+    options=list(LANG_CONFIG.keys()),
+    index=1
 )
 
 # Get current configuration
 current_config = LANG_CONFIG[selected_lang_label]
 
-# Load Chat History
-if "messages" not in st.session_state:
-    st.session_state.messages = load_chat_history()
+# Initialize Session
+if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = str(uuid.uuid4())
 
-# Display Chat History
-for message in st.session_state.messages:
-    if message["role"] == "user":
-        st.markdown(f'<div class="user-chat">👤 {message["content"]}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="ai-chat">🤖 {message["content"]}</div>', unsafe_allow_html=True)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Helper to save CURRENT chat
+def save_current_chat():
+    file_path = os.path.join("history", f"{st.session_state.current_chat_id}.json")
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+# Overwrite the old save_chat_history to point to new logic or just use save_current_chat
+def save_chat_history(msg):
+    # Backward compatibility shim
+    save_current_chat()
+
+# Display Chat History In Scrollable Container
+chat_container = st.container(height=400)
+with chat_container:
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            st.markdown(f'<div class="user-chat">👤 {message["content"]}</div>', unsafe_allow_html=True)
+        else:
+            # Check for error indicators in content
+            content = message["content"]
+            style_class = "ai-chat"
+            # Known error prefixes from TRANSLATIONS or typical error emojis
+            if "⚠️" in content or "❌" in content or "Oops" in content or "Error" in content or "🚫" in content:
+                style_class = "ai-chat-error"
+                
+            st.markdown(f'<div class="{style_class}">🤖 {content}</div>', unsafe_allow_html=True)
+            
+    # Auto-scroll to bottom using JavaScript
+    st.components.v1.html(
+        """
+        <script>
+            function scrollToBottom() {
+                // Target Streamlit's specific scrollable container structure
+                var scrollableElements = window.parent.document.querySelectorAll('.st-emotion-cache-1y4p8pa, [data-testid="stVerticalBlockBorderWrapper"] > div');
+                
+                scrollableElements.forEach(function(element) {
+                    element.scrollTop = element.scrollHeight;
+                });
+                
+                // Fallback: finding any div with significant overflow
+                var allDivs = window.parent.document.getElementsByTagName("div");
+                for (var i = 0; i < allDivs.length; i++) {
+                    var div = allDivs[i];
+                    if (getComputedStyle(div).overflowY === "auto" || getComputedStyle(div).overflowY === "scroll") {
+                        div.scrollTop = div.scrollHeight;
+                    }
+                }
+            }
+            // Run immediately and after a slight delay to ensure rendering
+            scrollToBottom();
+            setTimeout(scrollToBottom, 100);
+            setTimeout(scrollToBottom, 500);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 st.markdown("---")
 st.write(f"👇 Go ahead, I'm listening in **{current_config['sys_prompt']}**:")
@@ -387,7 +550,7 @@ audio = audiorecorder(
     start_prompt="Record", 
     stop_prompt="🔴 Recording...", 
     custom_style=recorder_style,
-    show_visualizer=True
+    show_visualizer=False
 )
 
 if len(audio) > 0:
@@ -399,8 +562,33 @@ if len(audio) > 0:
             user_text = audio_to_text(audio, current_config['code'])
         
         if user_text:
+            # Auto-renaming for new chats
+            if len(st.session_state.messages) == 0:
+                # Generate a safe filename from the first few words
+                safe_name = "".join([c for c in user_text[:30] if c.isalnum() or c in " -_"]).strip()
+                if not safe_name: safe_name = "New Chat"
+                
+                # Check for duplicate
+                base_name = safe_name
+                counter = 1
+                while os.path.exists(os.path.join("history", f"{safe_name}.json")):
+                    safe_name = f"{base_name} ({counter})"
+                    counter += 1
+                
+                # Rename the file if it exists (it shouldn't for a new chat usually, but good practice)
+                # Or just update the ID so the NEXT save uses the new name
+                
+                # If we're on a UUID, we can just switch to the new name
+                # If a file already existed for the UUID (e.g. empty init), rename it
+                old_id = st.session_state.current_chat_id
+                st.session_state.current_chat_id = safe_name
+                
+                old_path = os.path.join("history", f"{old_id}.json")
+                if os.path.exists(old_path):
+                    os.rename(old_path, os.path.join("history", f"{safe_name}.json"))
+            
             st.session_state.messages.append({"role": "user", "content": user_text})
-            save_chat_history(st.session_state.messages) # Save user message
+            save_current_chat() # Save user message
             
             # 2. Thinking phase
             with st.spinner(TRANSLATIONS[current_config['sys_prompt']]["thinking"]):
@@ -441,12 +629,34 @@ if len(audio) > 0:
                             final_reply = f"❌ {msg}"
 
             st.session_state.messages.append({"role": "assistant", "content": final_reply})
-            save_chat_history(st.session_state.messages) # Save AI response
+            save_current_chat() # Save AI response
             
             # 3. Speaking phase
+            # Generate audio and store in session state
             asyncio.run(text_to_speech(final_reply, current_config['voice']))
-            play_audio()
+            
+            if os.path.exists("reply.mp3"):
+                with open("reply.mp3", "rb") as f:
+                    st.session_state.audio_bytes = f.read()
             
             st.rerun()
         else:
             st.warning(TRANSLATIONS[current_config['sys_prompt']]["retry"])
+
+    import base64
+    
+    # Play audio if it exists in session state
+    if "audio_bytes" in st.session_state and st.session_state.audio_bytes:
+        # st.audio(st.session_state.audio_bytes, format="audio/mp3", autoplay=True)
+        
+        # Use HTML/JS to play audio without showing the player
+        b64 = base64.b64encode(st.session_state.audio_bytes).decode()
+        md = f"""
+            <audio autoplay style="display:none;">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+            """
+        st.markdown(md, unsafe_allow_html=True)
+        
+        # Clear it so it doesn't replay on next manual refresh
+        del st.session_state.audio_bytes

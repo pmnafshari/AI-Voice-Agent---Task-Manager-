@@ -231,3 +231,9 @@ chat_history.json
 # Helper Scripts
 list_models.py
 
+
+# Chat History directory
+history/
+
+# Debug scripts
+debug_notion_search.py

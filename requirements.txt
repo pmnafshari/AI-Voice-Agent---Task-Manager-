@@ -3,7 +3,7 @@ SpeechRecognition
 google-generativeai
 edge-tts
 python-dotenv
-audiorecorder
+streamlit-audiorecorder
 notion-client
 watchdog
 pydub
